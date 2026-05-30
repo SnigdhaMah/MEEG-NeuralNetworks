@@ -176,30 +176,35 @@ Config C tests joint VA quadrant classification using the raw time-series, which
 
 ### Experiment 1 — same-subject, different trials (within-subject baseline)
 
-**Goal:** establish how well each model learns when trained and tested on the *same* subjects. Because MEEG has only one recording session per subject, "different sessions" is approximated by a trial-level split: for each subject, 80 % of their 20 trials are used for training and 20 % for testing. All windows from the same trial stay in the same partition to prevent leakage from overlapping windows.
+**Goal:** establish how well each model learns when trained and tested on the *same* subjects. Because MEEG has only one recording session per subject, "different sessions" is approximated by a trial-level split: for each subject, 80 % of their 20 trials are first kept for the train/validation pool and 20 % are held out for testing. All windows from the same trial stay in the same partition to prevent leakage from overlapping windows.
 
-This is repeated for four training-set sizes to produce a learning curve:
+This is repeated for three subject-count settings to produce a learning curve:
 
-| Run | Subjects used | Train trials/subject | Test trials/subject |
-|---|---|---|---|
-| 1 | 32 (all) | 16 | 4 |
-| 2 | 20 | 16 | 4 |
-| 3 | 10 | 16 | 4 |
+| Run | Subjects used | Train trials/subject | Val trials/subject | Test trials/subject |
+|---|---|---|---|---|
+| 1 | 32 (all) | 14 | 2 | 4 |
+| 2 | 20 | 14 | 2 | 4 |
+| 3 | 10 | 14 | 2 | 4 |
 
-For runs 2–4, subjects are sampled randomly (fixed seed). The test set always contains the *same subjects* that were trained on.
+For runs 2–3, subjects are selected deterministically in the example below. The test set always contains the *same subjects* that were trained on, but different trials.
 
 ```python
 from data.meeg_dataset import load_meeg_raw, MEEGDataset
-from data.splits import get_cross_subject_splits, get_trial_kfold_splits
+from data.splits import get_cross_trial_splits
 
 all_samples = load_meeg_raw("data/raw/MEEG")
 
 for n_subjects in [32, 20, 10]:
-    # Restrict to the first n_subjects (deterministic subset)
-    subset_ids = sorted({s["subject_id"] for s in all_samples})[:n_subjects]
+    # Restrict to the first n_subjects by numeric subject id
+    subset_ids = sorted(
+        {s["subject_id"] for s in all_samples},
+        key=lambda sid: int(sid.split("_")[-1]),
+    )[:n_subjects]
     samples    = [s for s in all_samples if s["subject_id"] in subset_ids]
 
-    # Trial-level 80/20 split — same subjects in train and test
+    # Trial-level split: same subjects in train/val/test, different trials.
+    # With 20 trials/subject, test_ratio=0.2 and val_ratio=0.1 produce
+    # 14 train trials, 2 validation trials, and 4 test trials per subject.
     train_s, val_s, test_s = get_cross_trial_splits(samples, test_ratio=0.2,
                                                      val_ratio=0.1, seed=42)
 
@@ -212,32 +217,68 @@ for n_subjects in [32, 20, 10]:
         # ... train model, record accuracy for (n_subjects, config) ...
 ```
 
-> `get_cross_trial_splits` is a convenience wrapper around
-> `get_cross_subject_splits(strategy="cross_session")` in `splits.py`.
+`get_cross_trial_splits` is implemented directly in `data/splits.py`. It
+assigns whole trials to train/val/test and keeps all overlapping windows from
+the same `(subject_id, trial_idx)` in one partition to prevent leakage.
+
+Two split styles are supported:
+
+```python
+# Ratio-based split. If shuffle_trials=False, this uses early trials for train,
+# then validation, then late trials for test.
+train_s, val_s, test_s = get_cross_trial_splits(
+    samples,
+    test_ratio=0.2,
+    val_ratio=0.1,
+    shuffle_trials=False,
+)
+
+# Exact trial-count split. With 20 trials/subject, this means:
+# trial 0-13 -> train, trial 14-15 -> val, trial 16-19 -> test
+# when shuffle_trials=False.
+train_s, val_s, test_s = get_cross_trial_splits(
+    samples,
+    train_trials=14,
+    val_trials=2,
+    test_trials=4,
+    shuffle_trials=False,
+)
+```
+
+Set `shuffle_trials=True` to randomly assign trials within each subject before
+splitting. Set `shuffle_trials=False` when you want a fixed split by ascending
+`trial_idx`, such as "first N trials for train, last M trials for test".
 
 ---
 
 ### Experiment 2 — cross-subject generalisation
 
-**Goal:** measure how well models trained on a set of subjects generalise to *held-out subjects they have never seen*. The same four subject-count levels are used, but now the test set contains different subjects from the training set.
+**Goal:** measure how well models trained on a set of subjects generalise to *held-out subjects they have never seen*. The same three subject-count settings are used, but now the test set contains different subjects from the training set.
 
-| Run | Train subjects | Test subjects |
-|---|---|---|
-| 1 | 25 (random) | 7 (held out) |
-| 2 | 20 | 5 |
-| 3 | 12 | 3 |
+| Run | Subjects used | Train subjects | Val subjects | Test subjects |
+|---|---|---|---|---|
+| 1 | 32 | 23 | 2 | 7 |
+| 2 | 25 | 18 | 2 | 5 |
+| 3 | 15 | 11 | 1 | 3 |
 
 Subject assignment is fixed across all models and configs (same seed) so that results are comparable.
 
 ```python
+from data.meeg_dataset import load_meeg_raw, MEEGDataset
 from data.splits import get_cross_subject_splits
 
 all_samples = load_meeg_raw("data/raw/MEEG")
 
-for n_train in [25, 20, 12]:
+for n_total, n_test in [(32, 7), (25, 5), (15, 3)]:
+    subset_ids = sorted(
+        {s["subject_id"] for s in all_samples},
+        key=lambda sid: int(sid.split("_")[-1]),
+    )[:n_total]
+    samples = [s for s in all_samples if s["subject_id"] in subset_ids]
+
     train_s, val_s, test_s = get_cross_subject_splits(
-        all_samples,
-        test_ratio = 1 - n_train / 32,
+        samples,
+        test_ratio = n_test / n_total,
         val_ratio  = 0.1,
         seed       = 42,
     )
@@ -248,7 +289,7 @@ for n_train in [25, 20, 12]:
         train_ds = MEEGDataset(train_s, feature=feature, task=task)
         val_ds   = MEEGDataset(val_s,   feature=feature, task=task)
         test_ds  = MEEGDataset(test_s,  feature=feature, task=task)
-        # ... train model, record accuracy for (n_train, config) ...
+        # ... train model, record accuracy for this subject-count setting ...
 ```
 
 ---
